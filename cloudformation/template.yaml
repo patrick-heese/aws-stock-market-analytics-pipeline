@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stock Market Near Real-Time Data Analytics Pipeline (Kinesis -> Lambda -> S3/DynamoDB + Glue + Athena + SNS)
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 60
+    MemorySize: 256
+    Architectures: [x86_64]
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref StockDataTable
+        BUCKET_NAME: !Ref RawDataBucket
+        ATHENA_RESULTS_BUCKET: !Ref AthenaResultsBucket
+        SNS_TOPIC_ARN: !Ref StockTrendAlertsTopic
+
+Parameters:
+  EmailSubscription:
+    Type: String
+    Description: Email address to subscribe to SNS alerts (you’ll need to confirm the subscription).
+
+Resources:
+
+  # -------------------------------
+  # Kinesis Data Stream
+  # -------------------------------
+  StockMarketStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: stock-market-stream
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      RetentionPeriodHours: 24
+
+  # -------------------------------
+  # S3 Buckets (raw + athena results)
+  # -------------------------------
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stock-market-data-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "athena-query-results-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # -------------------------------
+  # DynamoDB Table (with stream)
+  # -------------------------------
+  StockDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stock-market-data
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: symbol
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: symbol
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  # -------------------------------
+  # SNS Topic (email subscription)
+  # -------------------------------
+  StockTrendAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: Stock_Trend_Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailSubscription
+
+  # -------------------------------
+  # IAM Role for Lambdas (scoped)
+  # -------------------------------
+  LambdaKinesisDdbSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Lambda_Kinesis_DynamoDB_SNS_Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScopedAccessKinesisDdbS3Sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read Kinesis stream (for Lambda event source)
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !GetAtt StockMarketStream.Arn
+
+              # Read DynamoDB stream (for Lambda event source)
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt StockDataTable.StreamArn
+
+              # Write + Read on the DynamoDB table
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt StockDataTable.Arn
+                  - !Sub "${StockDataTable.Arn}/index/*"
+
+              # Put objects to both S3 buckets
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${RawDataBucket}"
+                  - !Sub "arn:aws:s3:::${RawDataBucket}/*"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}/*"
+
+              # Publish alerts to SNS topic
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref StockTrendAlertsTopic
+
+  # -------------------------------
+  # Lambda: ProcessStockData (Kinesis -> S3 + DynamoDB)
+  # -------------------------------
+  ProcessStockDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ProcessStockData
+      Role: !GetAtt LambdaKinesisDdbSnsRole.Arn
+      CodeUri: ../src/processing_function/
+      Handler: processing_lambda.lambda_handler
+      Events:
+        FromKinesis:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt StockMarketStream.Arn
+            StartingPosition: LATEST
+            BatchSize: 2
+            Enabled: true
+
+  # -------------------------------
+  # Lambda: StockTrendAnalysis (DynamoDB stream -> SNS)
+  # -------------------------------
+  StockTrendAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: StockTrendAnalysis
+      Role: !GetAtt LambdaKinesisDdbSnsRole.Arn
+      CodeUri: ../src/analysis_function/
+      Handler: analysis_lambda.lambda_handler
+
+  StockTrendAnalysisEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt StockDataTable.StreamArn
+      FunctionName: !Ref StockTrendAnalysisFunction
+      StartingPosition: LATEST
+      BatchSize: 2
+      Enabled: true
+
+  # -------------------------------
+  # Glue Data Catalog (Database + Table for JSON in S3)
+  # -------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: stock_data_db
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: stock_data_table
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: 'TRUE'
+        StorageDescriptor:
+          Columns:
+            - { Name: symbol, Type: string }
+            - { Name: timestamp, Type: string }
+            - { Name: open, Type: double }
+            - { Name: high, Type: double }
+            - { Name: low, Type: double }
+            - { Name: price, Type: double }
+            - { Name: previous_close, Type: double }
+            - { Name: volume, Type: bigint }
+          Location: !Sub "s3://${RawDataBucket}/raw-data/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              paths: "symbol,timestamp,open,high,low,price,previous_close,volume"
+
+  # -------------------------------
+  # Athena Workgroup (fixed name + results location)
+  # -------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: stock-analytics-wg
+      Description: Workgroup for stock analytics queries
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/"
+
+Outputs:
+  KinesisStreamArn:
+    Description: ARN of Kinesis Data Stream
+    Value: !GetAtt StockMarketStream.Arn
+  RawBucketName:
+    Description: Raw data S3 bucket
+    Value: !Ref RawDataBucket
+  AthenaResultsBucketName:
+    Description: Athena results S3 bucket
+    Value: !Ref AthenaResultsBucket
+  DynamoTableName:
+    Description: DynamoDB table name
+    Value: !Ref StockDataTable
+  DynamoTableStreamArn:
+    Description: DynamoDB table stream ARN
+    Value: !GetAtt StockDataTable.StreamArn
+  SnsTopicArn:
+    Description: SNS Topic ARN for stock trend alerts
+    Value: !Ref StockTrendAlertsTopic
+  GlueDatabaseName:
+    Description: Glue database
+    Value: stock_data_db
+  GlueTableName:
+    Description: Glue table
+    Value: stock_data_table
+  AthenaWorkGroupOut:
+    Description: Athena WorkGroup name
+    Value: !Ref AthenaWorkGroup
