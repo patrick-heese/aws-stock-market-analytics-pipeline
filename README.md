@@ -13,7 +13,7 @@ A near real-time, event-driven analytics pipeline on AWS that ingests live stock
 
 - **Amazon Kinesis Data Streams** – Ingests streaming stock ticks from the producer script.  
 - **AWS Lambda (Processing)** – Transforms events from Kinesis, writes raw JSON to S3 and processed items to DynamoDB.  
-- **Amazon S3** – Stores raw event data (`raw-data/…`) and Athena query results in a dedicated bucket.  
+- **Amazon S3** – Stores raw event data and Athena query results in dedicated buckets.  
 - **AWS Glue Data Catalog** – Registers the raw JSON schema for SQL access via Athena.  
 - **Amazon Athena** – Queries historical stock data serverlessly; Workgroup is configured with the results bucket.  
 - **Amazon DynamoDB** – Holds processed records for low-latency querying, with a stream to trigger analysis.  
